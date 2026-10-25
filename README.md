@@ -42,6 +42,8 @@
 
 - 多账号请在 `COOKIES` 中添加多个 cookies，中间使用 `&` 连接即可（例如：`c1&c2&c3`）
 
+- **两个域名都签到**：Cookie 是按域名隔离的登录会话，需分别登录 [glados.cloud](https://glados.cloud) 和 [railgun.info](https://railgun.info) 各抓取一份 Cookie，用 `&` 连接（例如：`glados的cookie&railgun的cookie`）。脚本会自动探测每份 Cookie 在哪个域名下有效，只对有效组合签到——每个域名一条结果，不会出现跨域名的假失败。
+
 ![图片加载失败](imgs/2.png)
 ![图片加载失败](imgs/3.png)
 

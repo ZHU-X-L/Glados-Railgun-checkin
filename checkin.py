@@ -483,7 +483,7 @@ def render_payload(payload: dict, line_sep: str = "\n") -> str:
     lines = []
     for r in payload.get("rows", []):
         line = (
-            f"#{r['index']:<2}  {r['emoji']} {r['status']:<6}  {r['domain']:<13}  "
+            f"#{r['index']:<2}  {r['emoji']} {r['status']:<6}  🍪{r['cookie']}  {r['domain']:<13}  "
             f"获得 {r['points']} 积分 · 剩余 {r['days']} · 总 {r['points_total']}"
         )
         if r.get("exchange"):
@@ -596,32 +596,55 @@ class Checker:
         if self.config.verbose or force:
             logger.info(f"{LogEmoji.COOKIE}[{cookie_idx}] {LogEmoji.DOMAIN}[{domain}] {emoji} {message}")
 
+    def _probe_pairs(self) -> List[Tuple[int, str, str]]:
+        """探测每个 Cookie 在各域名下是否有效。
+
+        Cookie 是按域名隔离的登录会话，把同一 Cookie 发给不属于它的域名只会得到
+        "没有权限"。用无副作用的 GET /user/status 逐一探测，返回有效的
+        (cookie序号, cookie, domain) 配对；一个有效配对都没有时返回空列表。
+        """
+        pairs: List[Tuple[int, str, str]] = []
+        logger.info(f"{LogEmoji.INFO} 探测 Cookie 与域名的有效配对")
+        for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
+            for domain in self.config.DOMAINS:
+                with API(domain, cookie_idx, verbose=self.config.verbose) as api:
+                    _, code = api.get_status(cookie)
+                if code == CheckinStatus.SUCCESS.value:
+                    pairs.append((cookie_idx, cookie, domain))
+                    self._log(cookie_idx, domain, LogEmoji.SUCCESS, "Cookie 在该域名下有效", force=True)
+                else:
+                    self._log(cookie_idx, domain, LogEmoji.FAIL, "Cookie 在该域名下无效，跳过该组合", force=True)
+        return pairs
+
     def checkin_all(self):
         """执行所有签到任务"""
-        cookie_count = len(self.config.cookies_list)
-        domain_count = len(self.config.DOMAINS)
-        total_tasks = cookie_count * domain_count
-        task_idx = 0
+        # 只对能通过认证的 (Cookie, 域名) 组合签到，避免每天出现固定的跨域名假失败
+        pairs = self._probe_pairs()
+        if not pairs:
+            # 全部探测失败（Cookie 可能都已失效）：按原全量方式执行，保留失败诊断与推送提示
+            logger.warning(f"{LogEmoji.WARNING} 没有任何 Cookie×域名 配对通过探测，按全量方式执行")
+            pairs = [
+                (cookie_idx, cookie, domain)
+                for cookie_idx, cookie in enumerate(self.config.cookies_list, 1)
+                for domain in self.config.DOMAINS
+            ]
 
-        logger.info(f"{LogEmoji.INFO} 共 {cookie_count} 个 Cookie, {domain_count} 个域名, 共 {total_tasks} 个任务")
+        total_tasks = len(pairs)
+        logger.info(f"{LogEmoji.INFO} 共 {total_tasks} 个有效签到任务")
 
-        for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
-            logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
+        for task_idx, (cookie_idx, cookie, domain) in enumerate(pairs, 1):
+            logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
 
-            for domain in self.config.DOMAINS:
-                task_idx += 1
-                logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
+            result = self._checkin_on_domain(cookie, cookie_idx, domain)
+            self.results.append(result)
 
-                result = self._checkin_on_domain(cookie, cookie_idx, domain)
-                self.results.append(result)
-
-                result_message = f"结果: {result.status}"
-                if result.code == CheckinStatus.SUCCESS:
-                    if self.config.verbose:
-                        result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}, {result.exchange}"
-                    self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
-                else:
-                    self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
+            result_message = f"结果: {result.status}"
+            if result.code == CheckinStatus.SUCCESS:
+                if self.config.verbose:
+                    result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}, {result.exchange}"
+                self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
+            else:
+                self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
 
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
@@ -681,6 +704,7 @@ class Checker:
                 "index": i,
                 "emoji": status_emoji_map.get(res["code"], LogEmoji.ERROR),
                 "status": res["status"],
+                "cookie": res["cookie_index"],
                 "domain": res["domain"],
                 "points": res["points"],
                 "days": res["days"],
