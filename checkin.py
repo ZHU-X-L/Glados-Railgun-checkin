@@ -170,7 +170,8 @@ class Config:
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}，{self.ENV_SERVERCHAN_KEY} {'已设置' if serverchan_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
-        if verbose_env is not None:
+        # 空 Secrets 会让 workflow 传入空字符串，与其他变量一致地视为未设置
+        if verbose_env:
             verbose_env_lower = verbose_env.lower()
             if verbose_env_lower in ["true", "1", "yes", "y"]:
                 self.verbose = True
