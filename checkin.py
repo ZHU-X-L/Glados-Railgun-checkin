@@ -468,6 +468,7 @@ class CheckinResult:
     days: str = "None"
     points_total: str = "None"
     exchange: str = "未兑换"
+    message: str = ""  # 服务端返回的原始 message（如"没有权限"），用于失效诊断
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
@@ -633,6 +634,7 @@ class Checker:
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            result.message = checkin_result.get("message", "")
 
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
@@ -685,12 +687,26 @@ class Checker:
                 "exchange": res["exchange"],
             })
 
+        # 全部失败时在标题和正文附加根因提示，避免只看到"没有权限"却不知道要更新 Cookie
+        note = None
+        if results and fail_count == len(results):
+            permission_denied = any(
+                "权限" in (r.get("message") or "") or "permission" in (r.get("message") or "").lower()
+                for r in results
+            )
+            if permission_denied:
+                title += " · ⚠️Cookie疑似失效"
+                note = "⚠️ 所有接口均返回「没有权限」：Cookie 很可能已失效。请重新登录 glados.cloud 抓取新 Cookie，并更新仓库 Secret「GLADOS_COOKIES」。"
+            else:
+                note = "⚠️ 所有签到均失败，请查看 Actions 运行日志定位原因（常见为 Cookie 失效）。"
+
         return {
             "title": title,
             "rows": rows,
             "success": success_count,
             "fail": fail_count,
             "repeat": repeat_count,
+            "note": note,
         }
 
 
