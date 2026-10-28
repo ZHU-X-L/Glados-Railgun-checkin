@@ -79,6 +79,25 @@
 
 ## 问题排查与定位
 
+### 定时补签与失败告警
+
+- 默认在北京时间每天 **09:23、13:23、17:23、20:23** 执行，后续时段用于补签。GitHub Actions 的定时任务可能延迟或漏触发，以上是计划时间，不能保证准点运行。
+- 每份 Cookie 都会保留签到结果。某份 Cookie 在所有域名都未通过探测时，会单独回退逐域名签到；网络或未知探测错误不会被直接当成 Cookie 失效而跳过。
+- 部分签到失败也会在推送中列出 Cookie 序号、域名和原因。签到失败、Cookie 缺失或脚本异常时，完成推送后以非零退出码结束，使 Actions 显示失败；重复签到视为当天已完成。
+- 同一 Cookie 已在一个域名完成签到时，只忽略其他未通过认证的跨域组合；整份 Cookie 失败不会被其他 Cookie 的成功掩盖。
+- 成功运行记录的自动清理阈值调整为 30 天，失败记录不参与该清理步骤。
+
+如果提示 Cookie 认证失败，请分别登录需要签到的域名，重新获取 Cookie 后更新仓库 Secret `GLADOS_COOKIES`，再在 Actions 中手动执行 `auto check` 验证。Cookie 属于登录凭据，应只保存在 Secrets 中。
+
+### 本地回归验证
+
+```shell
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+回归测试使用模拟 HTTP 响应，不会真实签到、兑换或推送；拉取请求会自动运行同一套测试。
+
 大家可以通过查询 Actions 中的 running checkin 日志快速定位问题，有其他问题提交 issue。
 
   <img width="1684" height="844" alt="image" src="https://github.com/user-attachments/assets/45348a5f-43e4-45f5-8fdf-ce84d343b30d" />
@@ -86,3 +105,4 @@
 ## 声明
 
 本项目不保证稳定运行与更新，因 GitHub 相关规定可能会删库，请注意备份。
+
