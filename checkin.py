@@ -2,7 +2,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import requests
 from pypushdeer import PushDeer
@@ -76,8 +76,8 @@ def log_method(func):
             logger.error(f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}] {LogEmoji.ERROR} {method_name} 执行失败: {e}")
 
             DEFAULT_ERRORS = {
-                "checkin": {"status": "签到失败", "points": "0", "message": ""},
-                "get_status": ("None 天", -2),
+                "checkin": {"status": "签到失败", "points": "0", "message": "", "code": CheckinStatus.FAILURE, "auth_failed": False},
+                "get_status": ("None 天", None),
                 "get_points": ("None 积分", 0),
                 "exchange": "",
             }
@@ -276,15 +276,15 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                response = self.session.post(url, headers=session_headers, data=data, timeout=(10, 30))
             elif method.upper() == "GET":
-                response = self.session.get(url, headers=session_headers, timeout=(60, 120))
+                response = self.session.get(url, headers=session_headers, timeout=(10, 30))
             else:
                 self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
                 return None
 
             if not response.ok:
-                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
+                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，HTTP 状态码 {response.status_code}。", force=True)
                 return None
             return response
         except requests.exceptions.RequestException as e:
@@ -296,7 +296,7 @@ class API:
         return {"token": self.domain}
 
     @log_method
-    def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
+    def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus, bool]]:
         """执行签到，含设备平台自适应重试"""
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
@@ -337,20 +337,21 @@ class API:
 
         return raw
 
-    def _parse_checkin(self, raw: Optional[Dict]) -> Dict[str, Union[str, CheckinStatus]]:
+    def _parse_checkin(self, raw: Optional[Dict]) -> Dict[str, Union[str, CheckinStatus, bool]]:
         """解析签到响应为结果字典"""
-        result: Dict[str, Union[str, CheckinStatus]] = {
+        result: Dict[str, Union[str, CheckinStatus, bool]] = {
             "status": "签到失败",
             "points": "0",
             "message": "",
             "code": CheckinStatus.FAILURE,
+            "auth_failed": False,
         }
 
         if not raw:
             result["message"] = "网络请求失败"
             return result
 
-        code = raw.get("code", -2)
+        code = raw.get("code")
         message = raw.get("message", "无消息字段")
         points = str(raw.get("points", 0))
 
@@ -383,6 +384,7 @@ class API:
             else:
                 self._log("error", LogEmoji.ERROR, f"未预期响应(code={code}, message={message})，请检查 GLaDOS 服务状态或 Cookie", force=True)
             result["code"] = CheckinStatus.FAILURE
+            result["auth_failed"] = code == -2
             result["status"] = "签到失败"
             result["points"] = "0"
             result["message"] = message
@@ -390,27 +392,37 @@ class API:
         return result
 
     @log_method
-    def get_status(self, cookies: str) -> Tuple[str, int]:
-        """获取状态"""
+    def get_status(self, cookies: str) -> Tuple[str, Optional[int]]:
+        """获取状态；None 表示网络/解析失败，不能据此判定 Cookie 失效。"""
 
         url = self._get_full_url(self.STATUS_URL)
         response = self._make_request(url, "GET", cookies=cookies)
 
         if response:
             data = response.json()
-            code = data.get("code", -2)
-            left_days = data.get("data", {}).get("leftDays", None)
+            code = data.get("code")
+            if not isinstance(code, int) or isinstance(code, bool):
+                self._log("warning", LogEmoji.WARNING, "状态响应缺少有效 code，保留后续签到尝试", force=True)
+                return "None 天", None
+            if code != CheckinStatus.SUCCESS.value:
+                self._log("warning", LogEmoji.WARNING, f"状态接口返回 code={code}", force=True)
+                return "None 天", code
+            left_days = (data.get("data") or {}).get("leftDays")
 
             if left_days is not None:
-                left_days_int = int(float(left_days))
+                try:
+                    left_days_int = int(float(left_days))
+                except (TypeError, ValueError, OverflowError):
+                    self._log("warning", LogEmoji.WARNING, "剩余天数字段无法解析，保留认证成功状态", force=True)
+                    return "None 天", code
                 self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, leftDays : {left_days_int} 天}}")
                 return f"{left_days_int} 天", code
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, leftDays : {left_days} 天}}")
                 return "None 天", code
         else:
-            self._log("warning", LogEmoji.WARNING, "获取状态失败")
-            return "None 天", -2
+            self._log("warning", LogEmoji.WARNING, "获取状态失败，不能确定 Cookie 是否有效", force=True)
+            return "None 天", None
 
     @log_method
     def get_points(self, cookies: str) -> Tuple[str, int]:
@@ -471,6 +483,7 @@ class CheckinResult:
     exchange: str = "未兑换"
     message: str = ""  # 服务端返回的原始 message（如"没有权限"），用于失效诊断
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
+    auth_failed: bool = False  # 仅服务端明确返回 code=-2 时为 True
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
@@ -488,6 +501,8 @@ def render_payload(payload: dict, line_sep: str = "\n") -> str:
         )
         if r.get("exchange"):
             line += f" · {r['exchange']}"
+        if r.get("message"):
+            line += f" · 原因: {r['message']}"
         lines.append(line)
     note = payload.get("note")
     if note:
@@ -589,6 +604,7 @@ class Checker:
     def __init__(self, config: Config):
         self.config = config
         self.results = []
+        self._valid_probes: Set[Tuple[int, str]] = set()
 
     def _log(self, cookie_idx: int, domain: str, emoji: str, message: str, force: bool = False) -> None:
         """统一日志输出方法"""
@@ -601,36 +617,41 @@ class Checker:
 
         Cookie 是按域名隔离的登录会话，把同一 Cookie 发给不属于它的域名只会得到
         "没有权限"。用无副作用的 GET /user/status 逐一探测，返回有效的
-        (cookie序号, cookie, domain) 配对；一个有效配对都没有时返回空列表。
+        (cookie序号, cookie, domain) 配对。网络/未知错误保留签到尝试；
+        某份 Cookie 没有任何域名通过探测时，对该 Cookie 单独回退全量签到。
         """
         pairs: List[Tuple[int, str, str]] = []
         logger.info(f"{LogEmoji.INFO} 探测 Cookie 与域名的有效配对")
         for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
+            valid_pairs = []
+            uncertain_pairs = []
             for domain in self.config.DOMAINS:
                 with API(domain, cookie_idx, verbose=self.config.verbose) as api:
                     _, code = api.get_status(cookie)
                 if code == CheckinStatus.SUCCESS.value:
-                    pairs.append((cookie_idx, cookie, domain))
+                    valid_pairs.append((cookie_idx, cookie, domain))
+                    self._valid_probes.add((cookie_idx, domain))
                     self._log(cookie_idx, domain, LogEmoji.SUCCESS, "Cookie 在该域名下有效", force=True)
+                elif code == -2:
+                    self._log(cookie_idx, domain, LogEmoji.INFO, "状态接口认证未通过(code=-2)", force=True)
                 else:
-                    self._log(cookie_idx, domain, LogEmoji.FAIL, "Cookie 在该域名下无效，跳过该组合", force=True)
+                    uncertain_pairs.append((cookie_idx, cookie, domain))
+                    self._log(cookie_idx, domain, LogEmoji.WARNING, f"探测未能确认认证状态(code={code})，保留签到尝试", force=True)
+            if valid_pairs:
+                pairs.extend(valid_pairs + uncertain_pairs)
+            else:
+                logger.warning(f"{LogEmoji.COOKIE}[{cookie_idx}] 没有域名通过探测，逐域名签到以保留失败诊断")
+                pairs.extend((cookie_idx, cookie, domain) for domain in self.config.DOMAINS)
         return pairs
 
     def checkin_all(self):
         """执行所有签到任务"""
-        # 只对能通过认证的 (Cookie, 域名) 组合签到，避免每天出现固定的跨域名假失败
+        self.results = []
+        self._valid_probes.clear()
         pairs = self._probe_pairs()
-        if not pairs:
-            # 全部探测失败（Cookie 可能都已失效）：按原全量方式执行，保留失败诊断与推送提示
-            logger.warning(f"{LogEmoji.WARNING} 没有任何 Cookie×域名 配对通过探测，按全量方式执行")
-            pairs = [
-                (cookie_idx, cookie, domain)
-                for cookie_idx, cookie in enumerate(self.config.cookies_list, 1)
-                for domain in self.config.DOMAINS
-            ]
 
         total_tasks = len(pairs)
-        logger.info(f"{LogEmoji.INFO} 共 {total_tasks} 个有效签到任务")
+        logger.info(f"{LogEmoji.INFO} 共 {total_tasks} 个签到任务（含探测失败后的补充尝试）")
 
         for task_idx, (cookie_idx, cookie, domain) in enumerate(pairs, 1):
             logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
@@ -646,6 +667,21 @@ class Checker:
             else:
                 self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
 
+        # 同一 Cookie 已在其他域名完成签到时，仅忽略未通过认证的跨域组合。
+        # 曾通过探测的域名后来认证失败，仍需报告；整份 Cookie 失败也必须保留。
+        completed_cookies = {
+            result.cookie_index for result in self.results
+            if result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
+        }
+        self.results = [
+            result for result in self.results
+            if not (
+                result.auth_failed
+                and result.cookie_index in completed_cookies
+                and (result.cookie_index, result.domain) not in self._valid_probes
+            )
+        ]
+
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
 
@@ -657,8 +693,10 @@ class Checker:
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
+            result.points = checkin_result.get("points", "0")
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
             result.message = checkin_result.get("message", "")
+            result.auth_failed = checkin_result.get("auth_failed", False)
 
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
@@ -710,20 +748,20 @@ class Checker:
                 "days": res["days"],
                 "points_total": res["points_total"],
                 "exchange": res["exchange"],
+                "message": res["message"] if res["code"] == CheckinStatus.FAILURE else "",
             })
 
-        # 全部失败时在标题和正文附加根因提示，避免只看到"没有权限"却不知道要更新 Cookie
+        # 部分失败同样给出诊断，避免某个有效 Cookie 掩盖其他 Cookie 的失败。
         note = None
-        if results and fail_count == len(results):
-            permission_denied = any(
-                "权限" in (r.get("message") or "") or "permission" in (r.get("message") or "").lower()
-                for r in results
-            )
-            if permission_denied:
-                title += " · ⚠️Cookie疑似失效"
-                note = "⚠️ 所有接口均返回「没有权限」：Cookie 很可能已失效。请重新登录 glados.cloud 抓取新 Cookie，并更新仓库 Secret「GLADOS_COOKIES」。"
+        failed_results = [r for r in results if r["code"] == CheckinStatus.FAILURE]
+        if failed_results:
+            targets = "、".join(f"Cookie {r['cookie_index']} / {r['domain']}" for r in failed_results)
+            note = f"⚠️ 未完成签到：{targets}。"
+            if any(r["auth_failed"] for r in failed_results):
+                title += " · ⚠️Cookie认证失败"
+                note += "认证失败的 Cookie 请在对应域名重新登录后获取，并更新仓库 Secret「GLADOS_COOKIES」；两个域名分别使用各自的 Cookie。"
             else:
-                note = "⚠️ 所有签到均失败，请查看 Actions 运行日志定位原因（常见为 Cookie 失效）。"
+                note += "请查看 Actions 日志中的网络、设备或服务端错误；探测失败不等于 Cookie 失效。"
 
         return {
             "title": title,
@@ -747,7 +785,8 @@ def main():
 
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
-            payload = {"title": "# 未找到 cookies!", "rows": []}
+            payload = {"title": "GLaDOS 签到 · 未配置有效 Cookie", "rows": [], "note": "请在仓库 Secret「GLADOS_COOKIES」中配置有效 Cookie。"}
+            exit_code = 1
         else:
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
             checker = Checker(config)
@@ -755,6 +794,7 @@ def main():
 
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             payload = checker.format_results()
+            exit_code = 1 if payload["fail"] else 0
             logger.info(f"\n{LogEmoji.END} ========== 签到总结 ==========\n{payload['title']}\n{render_payload(payload)}")
 
     except Exception as e:
@@ -767,9 +807,9 @@ def main():
     push_service.send(payload["title"], payload)
     logger.info(f"{LogEmoji.END} 签到完成")
 
-    if exit_code != 0:
-        sys.exit(exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+

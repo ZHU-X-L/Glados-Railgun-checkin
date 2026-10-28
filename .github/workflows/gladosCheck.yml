@@ -8,13 +8,19 @@ on:
       - 'README.md'
       - 'imgs/**'
   schedule:
-    - cron: '18 9,12 * * *'
+    # 上午签到，下午和晚间补签；避开整点并为平台延迟留出余量。
+    - cron: '23 9,13,17,20 * * *'
       timezone: 'Asia/Shanghai'
+
+concurrency:
+  group: glados-checkin
+  cancel-in-progress: false
 
 jobs:
   build:
     name: glados/railgun checkin
     runs-on: ubuntu-latest
+    timeout-minutes: 20
       
     permissions:
       contents: read
@@ -55,13 +61,16 @@ jobs:
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
     - name: Keep alive
+      if: ${{ !cancelled() }}
       uses: liskin/gh-workflow-keepalive@v1 
         
     - name: Delete workflow runs
+      if: ${{ !cancelled() }}
       uses: Mattraks/delete-workflow-runs@v2
       with:
         token: ${{ github.token }}
         repository: ${{ github.repository }}
-        retain_days: 7
-        keep_minimum_runs: 7
+        retain_days: 30
+        keep_minimum_runs: 30
         delete_run_by_conclusion_pattern: success
+
