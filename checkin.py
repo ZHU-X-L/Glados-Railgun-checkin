@@ -1,5 +1,7 @@
+import hashlib
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple, Union
@@ -32,6 +34,7 @@ class APIEndpoint(Enum):
     """API端点"""
 
     CHECKIN = "/api/user/checkin"
+    CHECKIN_CHALLENGE = "/api/user/checkin/challenge"
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
     EXCHANGE = "/api/user/exchange"
@@ -193,10 +196,20 @@ PLATFORM_UA = {
 }
 
 
+"""签到 challenge 的 proof 后缀与提交前最小等待（与网页端实现保持一致）"""
+CHALLENGE_SUFFIX = "glados-observe-v1"
+CHALLENGE_DELAY_SECONDS = 2.5
+
+"""Cloudflare Turnstile 拒绝签到时的最大尝试次数与递增等待（秒）"""
+TURNSTILE_MAX_ATTEMPTS = 3
+TURNSTILE_RETRY_DELAY_SECONDS = 5
+
+
 class API:
     """API 调用"""
 
     CHECKIN_URL = APIEndpoint.CHECKIN.value
+    CHECKIN_CHALLENGE_URL = APIEndpoint.CHECKIN_CHALLENGE.value
     STATUS_URL = APIEndpoint.STATUS.value
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
@@ -267,7 +280,7 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None, json_body: bool = False, quiet: bool = False) -> Optional[requests.Response]:
         """发送 HTTP 请求"""
         session_headers = self.headers.copy()
         if user_agent:
@@ -276,7 +289,10 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(10, 30))
+                if json_body:
+                    response = self.session.post(url, headers=session_headers, json=data, timeout=(10, 30))
+                else:
+                    response = self.session.post(url, headers=session_headers, data=data, timeout=(10, 30))
             elif method.upper() == "GET":
                 response = self.session.get(url, headers=session_headers, timeout=(10, 30))
             else:
@@ -284,11 +300,13 @@ class API:
                 return None
 
             if not response.ok:
-                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，HTTP 状态码 {response.status_code}。", force=True)
+                if not quiet:
+                    self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，HTTP 状态码 {response.status_code}。", force=True)
                 return None
             return response
         except requests.exceptions.RequestException as e:
-            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
+            if not quiet:
+                self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
             return None
 
     def _get_checkin_data(self) -> Dict[str, str]:
@@ -297,14 +315,14 @@ class API:
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus, bool]]:
-        """执行签到，含设备平台自适应重试"""
+        """执行签到，含 Cloudflare 验证重试与设备平台自适应重试"""
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
 
         # 起始 UA 优先复用已学得的设备 UA，否则用会话默认 UA
         start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
 
-        raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
+        raw = self._checkin_with_retry(url, checkin_data, cookies, start_ua)
 
         # 设备不匹配(code 4)时按服务端 loginDevice 切换 UA 重试一次
         if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
@@ -312,13 +330,72 @@ class API:
             recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
             if recover_ua and recover_ua != start_ua:
                 self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
-                raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
+                raw = self._checkin_with_retry(url, checkin_data, cookies, recover_ua)
 
         return self._parse_checkin(raw)
 
+    def _checkin_with_retry(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
+        """发起签到；被 Cloudflare 人机验证拒绝时换新 challenge 重试"""
+        raw = None
+        for attempt in range(1, TURNSTILE_MAX_ATTEMPTS + 1):
+            raw = self._checkin_attempt(url, data, cookies, user_agent)
+            if not self._is_turnstile_rejected(raw):
+                return raw
+            if attempt < TURNSTILE_MAX_ATTEMPTS:
+                delay = TURNSTILE_RETRY_DELAY_SECONDS * attempt
+                self._log(
+                    "warning",
+                    LogEmoji.WARNING,
+                    f"Cloudflare 人机验证未通过（第 {attempt}/{TURNSTILE_MAX_ATTEMPTS} 次），{delay} 秒后重试",
+                    force=True,
+                )
+                time.sleep(delay)
+        return raw
+
+    @staticmethod
+    def _is_turnstile_rejected(raw: Optional[Dict]) -> bool:
+        """判断响应是否为 Cloudflare Turnstile 拒绝"""
+        if not isinstance(raw, dict):
+            return False
+        if raw.get("reason") == "turnstile" or raw.get("code") == 5:
+            return True
+        return "cloudflare" in str(raw.get("message", "")).lower()
+
+    def _get_checkin_challenge(self, cookies: str, user_agent: Optional[str]) -> Optional[Tuple[str, str]]:
+        """获取签到 challenge 并计算 proof；域名不支持或响应异常时返回 None，回退旧协议。"""
+        url = self._get_full_url(self.CHECKIN_CHALLENGE_URL)
+        response = self._make_request(url, "GET", cookies=cookies, user_agent=user_agent, quiet=True)
+        if not response:
+            self._log("info", LogEmoji.INFO, "未获取到签到 challenge（域名不支持或请求失败），使用旧协议提交", force=True)
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            self._log("warning", LogEmoji.WARNING, "签到 challenge 响应解析失败，使用旧协议提交", force=True)
+            return None
+        if not isinstance(data, dict) or data.get("code") != 0:
+            code = data.get("code") if isinstance(data, dict) else "未知"
+            self._log("warning", LogEmoji.WARNING, f"签到 challenge 响应异常(code={code})，使用旧协议提交", force=True)
+            return None
+        nonce = data.get("nonce")
+        if not nonce:
+            self._log("warning", LogEmoji.WARNING, "签到 challenge 缺少 nonce，使用旧协议提交", force=True)
+            return None
+        # challenge 到手后按网页端的等待间隔再提交，避免被判定为脚本
+        time.sleep(CHALLENGE_DELAY_SECONDS)
+        proof = hashlib.sha256(f"{nonce}.{CHALLENGE_SUFFIX}".encode()).hexdigest()
+        self._log("info", LogEmoji.INFO, "已获取签到 challenge")
+        return str(nonce), proof
+
     def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
         """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
-        response = self._make_request(url, "POST", data, cookies, user_agent=user_agent)
+        payload = dict(data)
+        challenge = self._get_checkin_challenge(cookies, user_agent)
+        if challenge:
+            nonce, proof = challenge
+            payload.update({"nonce": nonce, "proof": proof})
+
+        response = self._make_request(url, "POST", payload, cookies, user_agent=user_agent, json_body=bool(challenge))
         if not response:
             return None
         try:
@@ -381,6 +458,15 @@ class API:
                     self._log("error", LogEmoji.ERROR, f"服务端拒绝签到(code=4, reason={reason})，请检查账户风控状态", force=True)
             elif code == -2:
                 self._log("error", LogEmoji.ERROR, f"无权限(code=-2)：Cookie 可能已失效，请重新登录 {self.domain} 刷新 Cookie 并更新仓库 Secret GLADOS_COOKIES 后重试", force=True)
+            elif self._is_turnstile_rejected(raw):
+                self._log(
+                    "error",
+                    LogEmoji.ERROR,
+                    f"Cloudflare 人机验证未通过(code={code})，本次签到未记录；"
+                    f"已自动重试 {TURNSTILE_MAX_ATTEMPTS} 次仍失败，"
+                    "GitHub Actions 机房 IP 很难通过 Turnstile：请稍后重跑、改用非机房网络（如住宅代理），或在浏览器手动签到",
+                    force=True,
+                )
             else:
                 self._log("error", LogEmoji.ERROR, f"未预期响应(code={code}, message={message})，请检查 GLaDOS 服务状态或 Cookie", force=True)
             result["code"] = CheckinStatus.FAILURE
@@ -760,6 +846,8 @@ class Checker:
             if any(r["auth_failed"] for r in failed_results):
                 title += " · ⚠️Cookie认证失败"
                 note += "认证失败的 Cookie 请在对应域名重新登录后获取，并更新仓库 Secret「GLADOS_COOKIES」；两个域名分别使用各自的 Cookie。"
+            elif any("cloudflare" in str(r["message"]).lower() for r in failed_results):
+                note += "Cloudflare 人机验证拒绝了本次签到（未记分），机房 IP 下难以自动通过：可稍后重跑或在浏览器手动签到。"
             else:
                 note += "请查看 Actions 日志中的网络、设备或服务端错误；探测失败不等于 Cookie 失效。"
 

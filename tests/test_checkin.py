@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -30,6 +31,10 @@ class OfflineTest(unittest.TestCase):
         )
         network_guard.start()
         self.addCleanup(network_guard.stop)
+        # challenge 提交前的等待在测试中跳过
+        sleep_patch = patch('checkin.time.sleep')
+        sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
 
 
 class CookieCoverageTests(OfflineTest):
@@ -40,15 +45,23 @@ class CookieCoverageTests(OfflineTest):
             self.config = app.Config()
         self.probes = {}
         self.checkins = {}
+        self.challenges = {}
         self.attempts = []
+        self.challenge_requests = []
+        self.checkin_payloads = []
 
-        def fake_request(api, url, method, data=None, cookies='', user_agent=None):
+        def fake_request(api, url, method, data=None, cookies='', user_agent=None, json_body=False, quiet=False):
             key = (self.cookies.index(cookies) + 1, api.domain)
             if url.endswith('/status'):
                 code = self.probes.get(key, -2)
                 return None if code is None else response({'code': code, 'data': {'leftDays': '12.8'}})
+            if url.endswith('/checkin/challenge'):
+                self.challenge_requests.append(key)
+                challenge = self.challenges.get(key, {'code': 0, 'nonce': f'nonce-{key[0]}-{key[1]}'})
+                return None if challenge is None else response(challenge)
             if url.endswith('/checkin'):
                 self.attempts.append((key, user_agent))
+                self.checkin_payloads.append((key, dict(data or {}), json_body))
                 raw = self.checkins.get(key, {'code': -2, 'message': 'No permission'})
                 if isinstance(raw, list):
                     raw = raw.pop(0)
@@ -65,6 +78,14 @@ class CookieCoverageTests(OfflineTest):
         key = (index, domain)
         self.probes[key] = probe
         self.checkins[key] = {'code': code, 'message': 'ok', 'points': points}
+
+    def turnstile(self, index, domain, attempts=1):
+        key = (index, domain)
+        self.probes[key] = 0
+        self.checkins[key] = [
+            {'code': 5, 'message': 'Cloudflare verification failed. Nothing was recorded — please retry.'}
+            for _ in range(attempts)
+        ]
 
     def run_checker(self):
         checker = app.Checker(self.config)
@@ -177,6 +198,43 @@ class CookieCoverageTests(OfflineTest):
         payload = checker.format_results()
         self.assertEqual((payload['success'], payload['repeat'], payload['fail']), (0, 2, 0))
         self.assertEqual(len(payload['rows']), 2)
+
+    def test_checkin_uses_challenge_nonce_and_proof(self):
+        self.config.cookies_list = self.cookies[:1]
+        self.allow(1, 'glados.cloud')
+        self.run_checker()
+        key, sent, json_body = self.checkin_payloads[0]
+        self.assertEqual(key, (1, 'glados.cloud'))
+        self.assertTrue(json_body)
+        self.assertEqual(sent['nonce'], 'nonce-1-glados.cloud')
+        expected = hashlib.sha256(f"nonce-1-glados.cloud.{app.CHALLENGE_SUFFIX}".encode()).hexdigest()
+        self.assertEqual(sent['proof'], expected)
+
+    def test_missing_challenge_falls_back_to_legacy_request(self):
+        self.config.cookies_list = self.cookies[:1]
+        self.challenges[(1, 'glados.cloud')] = None
+        self.allow(1, 'glados.cloud')
+        _, payload = self.run_checker()
+        self.assertEqual(payload['success'], 1)
+        _, sent, json_body = self.checkin_payloads[0]
+        self.assertEqual(sent, {'token': 'glados.cloud'})
+        self.assertFalse(json_body)
+
+    def test_turnstile_rejection_is_retried_then_succeeds(self):
+        self.config.cookies_list = self.cookies[:1]
+        self.turnstile(1, 'glados.cloud')
+        self.checkins[(1, 'glados.cloud')].append({'code': 0, 'message': 'ok', 'points': 5})
+        _, payload = self.run_checker()
+        self.assertEqual((payload['success'], payload['fail']), (1, 0))
+        self.assertEqual(len([key for key, _ in self.attempts if key == (1, 'glados.cloud')]), 2)
+
+    def test_exhausted_turnstile_retries_report_actionable_reason(self):
+        self.config.cookies_list = self.cookies[:1]
+        self.turnstile(1, 'glados.cloud', attempts=app.TURNSTILE_MAX_ATTEMPTS)
+        _, payload = self.run_checker()
+        self.assertEqual(payload['fail'], 1)
+        self.assertEqual(len([key for key, _ in self.attempts if key == (1, 'glados.cloud')]), app.TURNSTILE_MAX_ATTEMPTS)
+        self.assertIn('Cloudflare', app.render_payload(payload))
 
     def test_main_returns_failure_after_pushing_all_failed_results(self):
         exit_code, payload = self.run_main()
