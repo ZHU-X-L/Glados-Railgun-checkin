@@ -220,6 +220,26 @@ class CookieCoverageTests(OfflineTest):
         self.assertEqual(sent, {'token': 'glados.cloud'})
         self.assertFalse(json_body)
 
+    def test_turnstile_challenge_uses_official_browser_flow(self):
+        self.config.cookies_list = self.cookies[:1]
+        self.allow(1, 'glados.cloud')
+        self.challenges[(1, 'glados.cloud')] = {'code': 0, 'nonce': 'nonce', 'turnstile': 'site-key'}
+        with patch.object(app.API, '_checkin_in_browser', return_value={'code': 0, 'points': 5}) as browser:
+            _, payload = self.run_checker()
+        browser.assert_called_once_with(
+            'https://glados.cloud/api/user/checkin', self.cookies[0], app.PLATFORM_UA['Windows'],
+        )
+        self.assertEqual(self.checkin_payloads, [])
+        self.assertEqual((payload['success'], payload['fail']), (1, 0))
+
+    def test_browser_response_can_confirm_an_already_completed_checkin(self):
+        self.config.cookies_list = self.cookies[:1]
+        self.allow(1, 'glados.cloud')
+        self.challenges[(1, 'glados.cloud')] = {'code': 0, 'nonce': 'nonce', 'turnstile': 'site-key'}
+        with patch.object(app.API, '_checkin_in_browser', return_value={'code': 0, 'repeated': True}):
+            _, payload = self.run_checker()
+        self.assertEqual((payload['success'], payload['repeat'], payload['fail']), (0, 1, 0))
+
     def test_turnstile_rejection_is_retried_then_succeeds(self):
         self.config.cookies_list = self.cookies[:1]
         self.turnstile(1, 'glados.cloud')
